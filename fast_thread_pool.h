@@ -11,8 +11,8 @@
 
 #include <atomic>
 #include <cstdint>
-#ifdef __AVX__
-#include <immintrin.h>
+#ifdef __SSE2__
+#include <emmintrin.h>
 #endif
 
 class FastThreadPool
@@ -20,13 +20,13 @@ class FastThreadPool
 private:
     struct FastThreadPoolItem
     {
-        FastThreadPoolItem* m_next;
+        std::atomic<FastThreadPoolItem*> m_next;
         void (*m_f)();
     };
 
     static void Pause()
     {
-#ifdef __AVX__
+#ifdef __SSE2__
         _mm_pause();
 #endif
     }
@@ -36,19 +36,15 @@ public:
     {
         // S1
         m_pHead.store(nullptr, std::memory_order_relaxed);
-
-        // S2
-        // HAPPENS-AFTER: S1
-        // SYNC-WITH: THREAD-LAUNCH
-        m_pTail.store(nullptr, std::memory_order_release);
+        m_pTail.store(nullptr, std::memory_order_relaxed);
     }
 
     void AddWork(void f())
     {
         FastThreadPoolItem* pItem = new FastThreadPoolItem;
 
-        // S3
-        pItem->m_next = nullptr;
+        // S2
+        pItem->m_next.store(nullptr, std::memory_order_relaxed);
         pItem->m_f = f;
 
         FastThreadPoolItem* pTail = m_pTail.load(std::memory_order_relaxed);
@@ -63,18 +59,24 @@ public:
 
             // L1
             //
-            // S4
-            // HAPPENS-AFTER: S3
+            // S3
+            // HAPPENS-AFTER: S2
             // SYNC-WITH: L3
-        } while (!m_pTail.compare_exchange_weak(pTail, pTail ? (FastThreadPoolItem*)((uintptr_t)pTail | 1) : pItem, std::memory_order_release, std::memory_order_relaxed));
+        } while (!m_pTail.compare_exchange_weak(
+            pTail,
+            pTail ? (FastThreadPoolItem*)((uintptr_t)pTail | 1) : pItem,
+            std::memory_order_release,
+            std::memory_order_relaxed));
 
         if (pTail)
         {
-            // S5
-            pTail->m_next = pItem;
+            // S4
+            // HAPPENS-AFTER: S2, S3
+            // SYNC-WITH: L3, L5
+            pTail->m_next.store(pItem, std::memory_order_release);
 
-            // S6
-            // HAPPENS-AFTER: S5
+            // S5
+            // HAPPENS-AFTER: S4
             // SYNC-WITH: L3
             m_pTail.store(pItem, std::memory_order_release);
         }
@@ -92,8 +94,8 @@ public:
 
                 // L2
                 //
-                // S7
-                // HAPPENS-AFTER: S3, S4
+                // S6
+                // HAPPENS-AFTER: S2, S3
                 // SYNC-WITH: L3
             } while (!m_pHead.compare_exchange_weak(pHead, pItem, std::memory_order_release, std::memory_order_relaxed));
         }
@@ -121,7 +123,7 @@ public:
             // also L3
             // HAPPENS-BEFORE: L4, L5
             //
-            // S8
+            // S7
         } while (!m_pHead.compare_exchange_weak(pHead, (FastThreadPoolItem*)(1), std::memory_order_acquire, std::memory_order_acquire));
 
         if (pHead)
@@ -145,15 +147,17 @@ public:
                 }
 
                 // also L4
-                // S9
+                // S8
             } while (!m_pTail.compare_exchange_weak(pTail, nullptr, std::memory_order_relaxed, std::memory_order_relaxed));
 
             // L5
-            FastThreadPoolItem* pNext = pTail == pHead ? nullptr : pHead->m_next;
+            // HAPPENS-BEFORE:L6
+            FastThreadPoolItem* pNext = pTail == pHead ? nullptr : pHead->m_next.load(std::memory_order_acquire);
 
-            // S10
+            // S9
             m_pHead.store(pNext, std::memory_order_relaxed);
 
+            // L6
             delete pHead;
 
             return f;
@@ -168,7 +172,7 @@ public:
         while (pItem)
         {
             FastThreadPoolItem* pPrev = pItem;
-            pItem = pItem->m_next;
+            pItem = pItem->m_next.load(std::memory_order_relaxed);
             delete pPrev;
         }
     }
